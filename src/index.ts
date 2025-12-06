@@ -10,7 +10,7 @@ const serverUrl = process.env.HAPPY_SERVER_URL || 'https://happy.engineering';
 async function main() {
   const server = new McpServer({
     name: 'happy-server-mcp',
-    version: '0.2.0',
+    version: '0.3.0',
   });
 
   let client: HappyClient | null = null;
@@ -166,19 +166,23 @@ async function main() {
     'Send a message to a Happy AI session to trigger it to work. The message will be sent with bypass permissions mode.',
     {
       session_id: z.string().describe('The session ID to send the message to'),
-      message: z.string().describe('The message text to send')
+      message: z.string().describe('The message text to send'),
+      wait: z.boolean().optional().describe('If true, wait for AI to finish processing before returning (default: false)')
     },
-    async ({ session_id, message }) => {
+    async ({ session_id, message, wait }) => {
       try {
         const happyClient = await getClient();
-        const result = await happyClient.sendMessage(session_id, message);
+        const result = await happyClient.sendMessage(session_id, message, wait ?? false);
 
         if (result.success) {
+          const waitNote = wait
+            ? 'AI has finished processing.'
+            : 'The session will process the message asynchronously. Use happy_read_messages to check for responses.';
           return {
             content: [
               {
                 type: 'text' as const,
-                text: `Message sent successfully to session ${session_id}.\n\nMessage: "${message}"\n\nNote: The session will process the message asynchronously. Use happy_read_messages to check for responses.`
+                text: `Message sent successfully to session ${session_id}.\n\nMessage: "${message}"\n\n${waitNote}${result.error ? `\n\nWarning: ${result.error}` : ''}`
               }
             ]
           };
@@ -215,19 +219,23 @@ async function main() {
       machine_id: z.string().describe('The machine ID to start the session on'),
       directory: z.string().describe('The directory path to run the session in'),
       message: z.string().optional().describe('Optional initial message to send to start the session working'),
-      agent: z.enum(['claude', 'codex']).optional().describe('Agent type to use (default: claude)')
+      agent: z.enum(['claude', 'codex']).optional().describe('Agent type to use (default: claude)'),
+      wait: z.boolean().optional().describe('If true, wait for AI to finish processing initial message before returning (default: false)')
     },
-    async ({ machine_id, directory, message, agent }) => {
+    async ({ machine_id, directory, message, agent, wait }) => {
       try {
         const happyClient = await getClient();
-        const result = await happyClient.startSession(machine_id, directory, message, agent ?? 'claude');
+        const result = await happyClient.startSession(machine_id, directory, message, agent ?? 'claude', wait ?? false);
 
         if (result.success && result.sessionId) {
+          const waitNote = (message && wait)
+            ? 'AI has finished processing the initial message.'
+            : (message ? 'Initial message sent. Use happy_read_messages to check session activity.' : 'Use happy_send_message to start working.');
           return {
             content: [
               {
                 type: 'text' as const,
-                text: `Session started successfully!\n\nSession ID: ${result.sessionId}\nDirectory: ${directory}\nAgent: ${agent ?? 'claude'}${message ? `\n\nInitial message sent: "${message}"` : ''}\n\nUse happy_read_messages to check session activity.`
+                text: `Session started successfully!\n\nSession ID: ${result.sessionId}\nDirectory: ${directory}\nAgent: ${agent ?? 'claude'}${message ? `\n\nInitial message: "${message}"` : ''}\n\n${waitNote}${result.error ? `\n\nWarning: ${result.error}` : ''}`
               }
             ]
           };
@@ -294,6 +302,54 @@ async function main() {
             {
               type: 'text' as const,
               text: `Error archiving session: ${error instanceof Error ? error.message : String(error)}`
+            }
+          ],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // Wait for idle tool
+  server.tool(
+    'happy_wait_for_idle',
+    'Wait for a Happy AI session to become idle (finish processing). Useful after sending a message to wait for AI to complete its work.',
+    {
+      session_id: z.string().describe('The session ID to wait for'),
+      timeout_seconds: z.number().optional().describe('Maximum time to wait in seconds (default: 120)')
+    },
+    async ({ session_id, timeout_seconds }) => {
+      try {
+        const happyClient = await getClient();
+        const timeoutMs = (timeout_seconds ?? 120) * 1000;
+        const result = await happyClient.waitForIdle(session_id, timeoutMs);
+
+        if (result.success) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Session ${session_id} is now idle. AI has finished processing.`
+              }
+            ]
+          };
+        } else {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Wait for idle failed: ${result.error}`
+              }
+            ],
+            isError: true
+          };
+        }
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Error waiting for idle: ${error instanceof Error ? error.message : String(error)}`
             }
           ],
           isError: true

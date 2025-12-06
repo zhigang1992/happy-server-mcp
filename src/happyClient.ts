@@ -12,6 +12,7 @@ import {
   MachineMetadata,
   DecryptedSession,
   SessionInfo,
+  SessionStatus,
   MachineInfo,
   MessageInfo,
   MessageContent,
@@ -331,16 +332,19 @@ export class HappyClient {
 
   /**
    * Start a new session on a machine
+   * @param wait - If true, wait for AI to finish processing initial message
    */
   async startSession(
     machineId: string,
     directory: string,
     message?: string,
-    agent: 'claude' | 'codex' = 'claude'
+    agent: 'claude' | 'codex' = 'claude',
+    wait: boolean = false
   ): Promise<{ success: boolean; sessionId?: string; error?: string }> {
     const { key, variant } = this.getEncryption();
 
-    return new Promise((resolve) => {
+    // Step 1: Spawn the session via RPC
+    const spawnResult = await new Promise<{ success: boolean; sessionId?: string; error?: string }>((resolve) => {
       let resolved = false;
 
       const socket = io(this.serverUrl, {
@@ -379,29 +383,13 @@ export class HappyClient {
         socket.emit('rpc-call', {
           method: `${machineId}:spawn-happy-session`,
           params: encryptedParams
-        }, async (response: { ok: boolean; result?: string; error?: string }) => {
+        }, (response: { ok: boolean; result?: string; error?: string }) => {
           clearTimeout(timeout);
           if (response.ok && response.result) {
             // Decrypt the response
             try {
               const decryptedResult = decrypt(key, variant, decodeBase64(response.result)) as { type: string; sessionId?: string; errorMessage?: string };
               if (decryptedResult?.type === 'success' && decryptedResult.sessionId) {
-                // If message provided, send it to the new session
-                if (message) {
-                  const content: UserMessageContent = {
-                    role: 'user',
-                    content: { type: 'text', text: message },
-                    meta: { sentFrom: 'mcp', permissionMode: 'bypassPermissions' }
-                  };
-                  const encrypted = encodeBase64(encrypt(key, variant, content));
-                  socket.emit('message', {
-                    sid: decryptedResult.sessionId,
-                    message: encrypted,
-                    localId: `mcp-${Date.now()}`
-                  });
-                  // Wait a bit for message to be sent
-                  await new Promise(r => setTimeout(r, 500));
-                }
                 cleanup({ success: true, sessionId: decryptedResult.sessionId });
               } else {
                 cleanup({ success: false, error: decryptedResult?.errorMessage || 'Failed to start session' });
@@ -425,6 +413,52 @@ export class HappyClient {
         cleanup({ success: false, error: `Socket error: ${error.message || String(error)}` });
       });
     });
+
+    if (!spawnResult.success || !spawnResult.sessionId) {
+      return spawnResult;
+    }
+
+    // Step 2: Wait for session to become active (give CLI time to connect)
+    // Poll the sessions API until we see this session as active
+    const sessionId = spawnResult.sessionId;
+    let sessionActive = false;
+    const maxWaitTime = 15000;
+    const startTime = Date.now();
+
+    while (!sessionActive && (Date.now() - startTime) < maxWaitTime) {
+      await new Promise(r => setTimeout(r, 1000));
+      try {
+        const sessions = await this.listSessions(100);
+        const session = sessions.find(s => s.id === sessionId);
+        if (session?.active) {
+          sessionActive = true;
+        }
+      } catch {
+        // Ignore errors, keep polling
+      }
+    }
+
+    if (!sessionActive) {
+      return { success: true, sessionId, error: 'Session spawned but may not be ready yet' };
+    }
+
+    // Step 3: If message provided, send it
+    if (message) {
+      const sendResult = await this.sendMessage(sessionId, message);
+      if (!sendResult.success) {
+        return { success: true, sessionId, error: `Session started but message failed: ${sendResult.error}` };
+      }
+
+      // Step 4: If wait=true, wait for AI to finish
+      if (wait) {
+        const idleResult = await this.waitForIdle(sessionId);
+        if (!idleResult.success) {
+          return { success: true, sessionId, error: `Session started but wait for idle failed: ${idleResult.error}` };
+        }
+      }
+    }
+
+    return { success: true, sessionId };
   }
 
   /**
@@ -536,8 +570,9 @@ export class HappyClient {
 
   /**
    * Send a message to a session via WebSocket
+   * @param wait - If true, wait for AI to finish processing the message
    */
-  async sendMessage(sessionId: string, text: string): Promise<{ success: boolean; error?: string }> {
+  async sendMessage(sessionId: string, text: string, wait: boolean = false): Promise<{ success: boolean; error?: string }> {
     const { key, variant } = this.getEncryption();
 
     // Create user message content
@@ -556,7 +591,7 @@ export class HappyClient {
     // Encrypt the message
     const encrypted = encodeBase64(encrypt(key, variant, content));
 
-    return new Promise((resolve) => {
+    const sendResult = await new Promise<{ success: boolean; error?: string }>((resolve) => {
       let resolved = false;
 
       const socket = io(this.serverUrl, {
@@ -593,6 +628,144 @@ export class HappyClient {
           clearTimeout(timeout);
           cleanup({ success: true });
         }, 1000);
+      });
+
+      socket.on('connect_error', (error) => {
+        clearTimeout(timeout);
+        cleanup({ success: false, error: `Connection error: ${error.message}` });
+      });
+
+      socket.on('error', (error: { message?: string }) => {
+        clearTimeout(timeout);
+        cleanup({ success: false, error: `Socket error: ${error.message || String(error)}` });
+      });
+    });
+
+    if (!sendResult.success) {
+      return sendResult;
+    }
+
+    // If wait=true, wait for AI to finish processing
+    if (wait) {
+      const idleResult = await this.waitForIdle(sessionId);
+      if (!idleResult.success) {
+        return { success: true, error: `Message sent but wait for idle failed: ${idleResult.error}` };
+      }
+    }
+
+    return { success: true };
+  }
+
+  /**
+   * Watch session status via WebSocket ephemeral updates
+   * Returns when the session reaches the target status or timeout
+   */
+  async waitForSessionStatus(
+    sessionId: string,
+    targetStatus: 'online' | 'thinking',
+    timeoutMs: number = 60000
+  ): Promise<{ success: boolean; status?: SessionStatus; error?: string }> {
+    return new Promise((resolve) => {
+      let resolved = false;
+
+      const socket = io(this.serverUrl, {
+        auth: {
+          token: this.credentials.token,
+          clientType: 'user-scoped'
+        },
+        path: '/v1/updates',
+        transports: ['websocket'],
+        reconnection: false,
+        timeout: timeoutMs
+      });
+
+      const cleanup = (result: { success: boolean; status?: SessionStatus; error?: string }) => {
+        if (resolved) return;
+        resolved = true;
+        socket.disconnect();
+        resolve(result);
+      };
+
+      const timeout = setTimeout(() => {
+        cleanup({ success: false, error: `Timeout waiting for session to become ${targetStatus}` });
+      }, timeoutMs);
+
+      socket.on('connect', () => {
+        // Listen for ephemeral updates
+        socket.on('ephemeral', (update: { type: string; id: string; active?: boolean; thinking?: boolean }) => {
+          if (update.type === 'activity' && update.id === sessionId) {
+            const status: SessionStatus = !update.active ? 'offline' : (update.thinking ? 'thinking' : 'online');
+
+            if (targetStatus === 'online' && status === 'online') {
+              clearTimeout(timeout);
+              cleanup({ success: true, status: 'online' });
+            } else if (targetStatus === 'thinking' && status === 'thinking') {
+              clearTimeout(timeout);
+              cleanup({ success: true, status: 'thinking' });
+            }
+          }
+        });
+      });
+
+      socket.on('connect_error', (error) => {
+        clearTimeout(timeout);
+        cleanup({ success: false, error: `Connection error: ${error.message}` });
+      });
+
+      socket.on('error', (error: { message?: string }) => {
+        clearTimeout(timeout);
+        cleanup({ success: false, error: `Socket error: ${error.message || String(error)}` });
+      });
+    });
+  }
+
+  /**
+   * Wait for a session to become idle (online but not thinking)
+   * Useful after sending a message to wait for AI to finish processing
+   */
+  async waitForIdle(
+    sessionId: string,
+    timeoutMs: number = 120000
+  ): Promise<{ success: boolean; error?: string }> {
+    return new Promise((resolve) => {
+      let resolved = false;
+      let sawThinking = false;
+
+      const socket = io(this.serverUrl, {
+        auth: {
+          token: this.credentials.token,
+          clientType: 'user-scoped'
+        },
+        path: '/v1/updates',
+        transports: ['websocket'],
+        reconnection: false,
+        timeout: timeoutMs
+      });
+
+      const cleanup = (result: { success: boolean; error?: string }) => {
+        if (resolved) return;
+        resolved = true;
+        socket.disconnect();
+        resolve(result);
+      };
+
+      const timeout = setTimeout(() => {
+        cleanup({ success: false, error: 'Timeout waiting for session to become idle' });
+      }, timeoutMs);
+
+      socket.on('connect', () => {
+        // Listen for ephemeral updates
+        socket.on('ephemeral', (update: { type: string; id: string; active?: boolean; thinking?: boolean }) => {
+          if (update.type === 'activity' && update.id === sessionId) {
+            if (update.thinking) {
+              sawThinking = true;
+            } else if (update.active && sawThinking) {
+              // Session was thinking and is now online (idle)
+              clearTimeout(timeout);
+              cleanup({ success: true });
+            }
+          }
+        });
       });
 
       socket.on('connect_error', (error) => {

@@ -112,6 +112,9 @@ export interface DecryptedSession {
   encryptionVariant: 'legacy' | 'dataKey';
 }
 
+// Session status - matches the UI indicators
+export type SessionStatus = 'offline' | 'online' | 'thinking';
+
 // Simplified session for MCP tool output
 export interface SessionInfo {
   id: string;
@@ -124,6 +127,8 @@ export interface SessionInfo {
   activeAt: number;
   updatedAt: number;
   createdAt: number;
+  // Status from ephemeral updates - only available via WebSocket
+  status?: SessionStatus;
 }
 
 // Machine metadata (matches MachineMetadataSchema from Happy app)
