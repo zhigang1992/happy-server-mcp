@@ -10,7 +10,7 @@ const serverUrl = process.env.HAPPY_SERVER_URL || 'https://happy.engineering';
 async function main() {
   const server = new McpServer({
     name: 'happy-server-mcp',
-    version: '0.3.1',
+    version: '0.3.2',
   });
 
   let client: HappyClient | null = null;

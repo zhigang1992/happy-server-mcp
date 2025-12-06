@@ -787,14 +787,31 @@ export class HappyClient {
   /**
    * Wait for a session to become idle (online but not thinking)
    * Useful after sending a message to wait for AI to finish processing
+   * If session is already idle, returns immediately
    */
   async waitForIdle(
     sessionId: string,
     timeoutMs: number = 120000
   ): Promise<{ success: boolean; error?: string }> {
+    // First, check current session state via API
+    // If already idle, return immediately without waiting for ephemeral updates
+    try {
+      const sessions = await this.listSessions(100);
+      const session = sessions.find(s => s.id === sessionId);
+      // Note: We can't know 'thinking' state from API, but if session is not active,
+      // we know it's definitely not processing. If active, we need to wait for ephemeral.
+      if (session && !session.active) {
+        // Session is offline/inactive, consider it idle
+        return { success: true };
+      }
+    } catch {
+      // Ignore API errors, proceed with WebSocket
+    }
+
     return new Promise((resolve) => {
       let resolved = false;
       let sawThinking = false;
+      let checkedInitialState = false;
 
       const socket = io(this.serverUrl, {
         auth: {
@@ -819,11 +836,34 @@ export class HappyClient {
       }, timeoutMs);
 
       socket.on('connect', () => {
+        // Set a grace period - if we don't receive any 'thinking' update within 3 seconds,
+        // assume the session is already idle (no activity happening)
+        const graceTimeout = setTimeout(() => {
+          if (!sawThinking) {
+            // No thinking update received, assume already idle
+            clearTimeout(timeout);
+            cleanup({ success: true });
+          }
+        }, 3000);
+
         // Listen for ephemeral updates
         socket.on('ephemeral', (update: { type: string; id: string; active?: boolean; thinking?: boolean }) => {
           if (update.type === 'activity' && update.id === sessionId) {
+            // On first update for this session, check if already idle
+            if (!checkedInitialState) {
+              checkedInitialState = true;
+              clearTimeout(graceTimeout);
+              if (update.active && !update.thinking) {
+                // Already idle, return immediately
+                clearTimeout(timeout);
+                cleanup({ success: true });
+                return;
+              }
+            }
+
             if (update.thinking) {
               sawThinking = true;
+              clearTimeout(graceTimeout);
             } else if (update.active && sawThinking) {
               // Session was thinking and is now online (idle)
               clearTimeout(timeout);
