@@ -1,7 +1,7 @@
 {
   "name": "@zhigang1992/happy-server-mcp",
-  "version": "0.1.1",
-  "description": "MCP server for Happy AI session management - query sessions, send messages, and read responses",
+  "version": "0.2.1",
+  "description": "MCP server for Happy AI session management - query sessions, send messages, read responses, manage machines, start/archive sessions",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {

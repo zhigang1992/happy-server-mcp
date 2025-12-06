@@ -24,12 +24,23 @@ export interface Credentials {
   };
 }
 
-// Session metadata
+// Session metadata (matches MetadataSchema from Happy app)
 export interface SessionMetadata {
-  title?: string;
+  path: string;
+  host: string;
+  version?: string;
+  name?: string;
+  os?: string;
   summary?: { text: string; updatedAt: number };
-  cwd?: string;
-  flavor?: 'claude' | 'codex';
+  machineId?: string;
+  claudeSessionId?: string;
+  tools?: string[];
+  slashCommands?: string[];
+  homeDir?: string;
+  happyHomeDir?: string;
+  hostPid?: number;
+  flavor?: string;
+  permissionMode?: 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan';
   [key: string]: unknown;
 }
 
@@ -105,12 +116,55 @@ export interface DecryptedSession {
 export interface SessionInfo {
   id: string;
   title: string | null;
+  path: string | null;
+  host: string | null;
+  machineId: string | null;
   flavor: string | null;
-  cwd: string | null;
   active: boolean;
   activeAt: number;
   updatedAt: number;
   createdAt: number;
+}
+
+// Machine metadata (matches MachineMetadataSchema from Happy app)
+export interface MachineMetadata {
+  host: string;
+  platform: string;
+  happyCliVersion: string;
+  happyHomeDir: string;
+  homeDir: string;
+  username?: string;
+  arch?: string;
+  displayName?: string;
+  daemonLastKnownStatus?: 'running' | 'shutting-down';
+  daemonLastKnownPid?: number;
+  shutdownRequestedAt?: number;
+  shutdownSource?: 'happy-app' | 'happy-cli' | 'os-signal' | 'unknown';
+}
+
+// API machine response
+export interface ApiMachine {
+  id: string;
+  seq: number;
+  createdAt: number;
+  updatedAt: number;
+  active: boolean;
+  activeAt: number;
+  metadata: string; // encrypted
+  metadataVersion: number;
+  daemonState: string | null;
+  daemonStateVersion: number;
+}
+
+// Simplified machine for MCP tool output
+export interface MachineInfo {
+  id: string;
+  host: string | null;
+  displayName: string | null;
+  platform: string | null;
+  homeDir: string | null;
+  active: boolean;
+  activeAt: number;
 }
 
 // Simplified message for MCP tool output

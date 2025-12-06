@@ -10,7 +10,7 @@ const serverUrl = process.env.HAPPY_SERVER_URL || 'https://happy.engineering';
 async function main() {
   const server = new McpServer({
     name: 'happy-server-mcp',
-    version: '0.1.0',
+    version: '0.2.0',
   });
 
   let client: HappyClient | null = null;
@@ -25,7 +25,7 @@ async function main() {
   // List sessions tool
   server.tool(
     'happy_list_sessions',
-    'List all Happy AI sessions. Returns session IDs, titles, working directories, and activity status.',
+    'List all Happy AI sessions. Returns session IDs, titles, paths, machines, and activity status.',
     {
       limit: z.number().optional().describe('Maximum number of sessions to return (default: 50)')
     },
@@ -39,8 +39,10 @@ async function main() {
           const lastActive = new Date(session.activeAt).toLocaleString();
           return `${status} [${session.id}]
   Title: ${session.title || '(untitled)'}
-  Flavor: ${session.flavor || 'unknown'}
-  CWD: ${session.cwd || '(not set)'}
+  Path: ${session.path || '(unknown)'}
+  Host: ${session.host || '(unknown)'}
+  Machine ID: ${session.machineId || '(unknown)'}
+  Flavor: ${session.flavor || 'claude'}
   Last Active: ${lastActive}`;
         }).join('\n\n');
 
@@ -60,6 +62,52 @@ async function main() {
             {
               type: 'text' as const,
               text: `Error listing sessions: ${error instanceof Error ? error.message : String(error)}`
+            }
+          ],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // List machines tool
+  server.tool(
+    'happy_list_machines',
+    'List all machines registered with Happy. Returns machine IDs, hostnames, platforms, and activity status.',
+    {},
+    async () => {
+      try {
+        const happyClient = await getClient();
+        const machines = await happyClient.listMachines();
+
+        const formatted = machines.map(machine => {
+          const status = machine.active ? '🟢 Online' : '⚪ Offline';
+          const lastActive = new Date(machine.activeAt).toLocaleString();
+          const displayName = machine.displayName || machine.host || '(unknown)';
+          return `${status} [${machine.id}]
+  Name: ${displayName}
+  Host: ${machine.host || '(unknown)'}
+  Platform: ${machine.platform || '(unknown)'}
+  Home: ${machine.homeDir || '(unknown)'}
+  Last Active: ${lastActive}`;
+        }).join('\n\n');
+
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: machines.length > 0
+                ? `Found ${machines.length} machines:\n\n${formatted}`
+                : 'No machines found.'
+            }
+          ]
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Error listing machines: ${error instanceof Error ? error.message : String(error)}`
             }
           ],
           isError: true
@@ -151,6 +199,101 @@ async function main() {
             {
               type: 'text' as const,
               text: `Error sending message: ${error instanceof Error ? error.message : String(error)}`
+            }
+          ],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // Start session tool
+  server.tool(
+    'happy_start_session',
+    'Start a new Happy AI session on a machine. Use happy_list_machines to find available machines first.',
+    {
+      machine_id: z.string().describe('The machine ID to start the session on'),
+      directory: z.string().describe('The directory path to run the session in'),
+      message: z.string().optional().describe('Optional initial message to send to start the session working'),
+      agent: z.enum(['claude', 'codex']).optional().describe('Agent type to use (default: claude)')
+    },
+    async ({ machine_id, directory, message, agent }) => {
+      try {
+        const happyClient = await getClient();
+        const result = await happyClient.startSession(machine_id, directory, message, agent ?? 'claude');
+
+        if (result.success && result.sessionId) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Session started successfully!\n\nSession ID: ${result.sessionId}\nDirectory: ${directory}\nAgent: ${agent ?? 'claude'}${message ? `\n\nInitial message sent: "${message}"` : ''}\n\nUse happy_read_messages to check session activity.`
+              }
+            ]
+          };
+        } else {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Failed to start session: ${result.error}`
+              }
+            ],
+            isError: true
+          };
+        }
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Error starting session: ${error instanceof Error ? error.message : String(error)}`
+            }
+          ],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // Archive session tool
+  server.tool(
+    'happy_archive_session',
+    'Archive (stop) a Happy AI session. The session will be terminated and marked as inactive.',
+    {
+      session_id: z.string().describe('The session ID to archive')
+    },
+    async ({ session_id }) => {
+      try {
+        const happyClient = await getClient();
+        const result = await happyClient.archiveSession(session_id);
+
+        if (result.success) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Session ${session_id} has been archived successfully.`
+              }
+            ]
+          };
+        } else {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Failed to archive session: ${result.error}`
+              }
+            ],
+            isError: true
+          };
+        }
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Error archiving session: ${error instanceof Error ? error.message : String(error)}`
             }
           ],
           isError: true

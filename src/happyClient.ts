@@ -7,9 +7,12 @@ import {
   CredentialsFileSchema,
   ApiSession,
   ApiMessage,
+  ApiMachine,
   SessionMetadata,
+  MachineMetadata,
   DecryptedSession,
   SessionInfo,
+  MachineInfo,
   MessageInfo,
   MessageContent,
   UserMessageContent,
@@ -136,6 +139,42 @@ export class HappyClient {
   }
 
   /**
+   * Get session title from metadata (matches getSessionName from Happy app)
+   */
+  private getSessionTitle(metadata: SessionMetadata | null): string | null {
+    if (!metadata) return null;
+    // Prefer summary.text if available
+    if (metadata.summary?.text) {
+      return metadata.summary.text;
+    }
+    // Fall back to last segment of path
+    if (metadata.path) {
+      const segments = metadata.path.split('/').filter(Boolean);
+      return segments.pop() || null;
+    }
+    return null;
+  }
+
+  /**
+   * Format path relative to home directory (matches formatPathRelativeToHome from Happy app)
+   */
+  private formatPathRelativeToHome(path: string, homeDir?: string): string {
+    if (!homeDir) return path;
+    const normalizedHome = homeDir.endsWith('/') ? homeDir.slice(0, -1) : homeDir;
+    if (path.startsWith(normalizedHome)) {
+      const relativePath = path.slice(normalizedHome.length);
+      if (relativePath.startsWith('/')) {
+        return '~' + relativePath;
+      } else if (relativePath === '') {
+        return '~';
+      } else {
+        return '~/' + relativePath;
+      }
+    }
+    return path;
+  }
+
+  /**
    * List all sessions
    */
   async listSessions(limit: number = 50): Promise<SessionInfo[]> {
@@ -160,9 +199,11 @@ export class HappyClient {
 
       sessions.push({
         id: session.id,
-        title: metadata?.title ?? null,
+        title: this.getSessionTitle(metadata),
+        path: metadata?.path ? this.formatPathRelativeToHome(metadata.path, metadata.homeDir) : null,
+        host: metadata?.host ?? null,
+        machineId: metadata?.machineId ?? null,
         flavor: metadata?.flavor ?? null,
-        cwd: metadata?.cwd ?? null,
         active: session.active,
         activeAt: session.activeAt,
         updatedAt: session.updatedAt,
@@ -171,6 +212,219 @@ export class HappyClient {
     }
 
     return sessions;
+  }
+
+  /**
+   * List all machines
+   */
+  async listMachines(): Promise<MachineInfo[]> {
+    const response = await fetch(`${this.serverUrl}/v1/machines`, {
+      headers: {
+        'Authorization': `Bearer ${this.credentials.token}`,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to fetch machines: ${response.status} ${response.statusText}`);
+    }
+
+    const data = await response.json() as ApiMachine[];
+    const { key, variant } = this.getEncryption();
+
+    const machines: MachineInfo[] = [];
+
+    for (const machine of data) {
+      let metadata: MachineMetadata | null = null;
+      try {
+        const decoded = decodeBase64(machine.metadata);
+        metadata = decrypt(key, variant, decoded) as MachineMetadata | null;
+      } catch {
+        // Ignore decryption errors
+      }
+
+      machines.push({
+        id: machine.id,
+        host: metadata?.host ?? null,
+        displayName: metadata?.displayName ?? null,
+        platform: metadata?.platform ?? null,
+        homeDir: metadata?.homeDir ?? null,
+        active: machine.active,
+        activeAt: machine.activeAt
+      });
+    }
+
+    return machines;
+  }
+
+  /**
+   * Archive (kill) a session
+   */
+  async archiveSession(sessionId: string): Promise<{ success: boolean; error?: string }> {
+    const { key, variant } = this.getEncryption();
+
+    return new Promise((resolve) => {
+      let resolved = false;
+
+      const socket = io(this.serverUrl, {
+        auth: {
+          token: this.credentials.token,
+          clientType: 'user-scoped'
+        },
+        path: '/v1/updates',
+        transports: ['websocket'],
+        reconnection: false,
+        timeout: 15000
+      });
+
+      const cleanup = (result: { success: boolean; error?: string }) => {
+        if (resolved) return;
+        resolved = true;
+        socket.disconnect();
+        resolve(result);
+      };
+
+      const timeout = setTimeout(() => {
+        cleanup({ success: false, error: 'Connection timeout' });
+      }, 15000);
+
+      socket.on('connect', () => {
+        // Encrypt the empty params for killSession
+        const encryptedParams = encodeBase64(encrypt(key, variant, {}));
+
+        // Use rpc-call with the correct method format: sessionId:methodName
+        socket.emit('rpc-call', {
+          method: `${sessionId}:killSession`,
+          params: encryptedParams
+        }, (response: { ok: boolean; result?: string; error?: string }) => {
+          clearTimeout(timeout);
+          if (response.ok && response.result) {
+            // Decrypt the response
+            try {
+              const decryptedResult = decrypt(key, variant, decodeBase64(response.result)) as { success?: boolean; message?: string };
+              if (decryptedResult?.success) {
+                cleanup({ success: true });
+              } else {
+                cleanup({ success: false, error: decryptedResult?.message || 'Failed to archive session' });
+              }
+            } catch {
+              // Even if we can't decrypt, if ok is true, consider it success
+              cleanup({ success: true });
+            }
+          } else {
+            cleanup({ success: false, error: response.error || 'RPC call failed' });
+          }
+        });
+      });
+
+      socket.on('connect_error', (error) => {
+        clearTimeout(timeout);
+        cleanup({ success: false, error: `Connection error: ${error.message}` });
+      });
+
+      socket.on('error', (error: { message?: string }) => {
+        clearTimeout(timeout);
+        cleanup({ success: false, error: `Socket error: ${error.message || String(error)}` });
+      });
+    });
+  }
+
+  /**
+   * Start a new session on a machine
+   */
+  async startSession(
+    machineId: string,
+    directory: string,
+    message?: string,
+    agent: 'claude' | 'codex' = 'claude'
+  ): Promise<{ success: boolean; sessionId?: string; error?: string }> {
+    const { key, variant } = this.getEncryption();
+
+    return new Promise((resolve) => {
+      let resolved = false;
+
+      const socket = io(this.serverUrl, {
+        auth: {
+          token: this.credentials.token,
+          clientType: 'user-scoped'
+        },
+        path: '/v1/updates',
+        transports: ['websocket'],
+        reconnection: false,
+        timeout: 30000
+      });
+
+      const cleanup = (result: { success: boolean; sessionId?: string; error?: string }) => {
+        if (resolved) return;
+        resolved = true;
+        socket.disconnect();
+        resolve(result);
+      };
+
+      const timeout = setTimeout(() => {
+        cleanup({ success: false, error: 'Connection timeout' });
+      }, 30000);
+
+      socket.on('connect', () => {
+        // Encrypt the spawn params
+        const spawnParams = {
+          type: 'spawn-in-directory',
+          directory,
+          approvedNewDirectoryCreation: true,
+          agent
+        };
+        const encryptedParams = encodeBase64(encrypt(key, variant, spawnParams));
+
+        // Use rpc-call with the correct method format: machineId:methodName
+        socket.emit('rpc-call', {
+          method: `${machineId}:spawn-happy-session`,
+          params: encryptedParams
+        }, async (response: { ok: boolean; result?: string; error?: string }) => {
+          clearTimeout(timeout);
+          if (response.ok && response.result) {
+            // Decrypt the response
+            try {
+              const decryptedResult = decrypt(key, variant, decodeBase64(response.result)) as { type: string; sessionId?: string; errorMessage?: string };
+              if (decryptedResult?.type === 'success' && decryptedResult.sessionId) {
+                // If message provided, send it to the new session
+                if (message) {
+                  const content: UserMessageContent = {
+                    role: 'user',
+                    content: { type: 'text', text: message },
+                    meta: { sentFrom: 'mcp', permissionMode: 'bypassPermissions' }
+                  };
+                  const encrypted = encodeBase64(encrypt(key, variant, content));
+                  socket.emit('message', {
+                    sid: decryptedResult.sessionId,
+                    message: encrypted,
+                    localId: `mcp-${Date.now()}`
+                  });
+                  // Wait a bit for message to be sent
+                  await new Promise(r => setTimeout(r, 500));
+                }
+                cleanup({ success: true, sessionId: decryptedResult.sessionId });
+              } else {
+                cleanup({ success: false, error: decryptedResult?.errorMessage || 'Failed to start session' });
+              }
+            } catch (e) {
+              cleanup({ success: false, error: `Failed to decrypt response: ${e}` });
+            }
+          } else {
+            cleanup({ success: false, error: response.error || 'RPC call failed' });
+          }
+        });
+      });
+
+      socket.on('connect_error', (error) => {
+        clearTimeout(timeout);
+        cleanup({ success: false, error: `Connection error: ${error.message}` });
+      });
+
+      socket.on('error', (error: { message?: string }) => {
+        clearTimeout(timeout);
+        cleanup({ success: false, error: `Socket error: ${error.message || String(error)}` });
+      });
+    });
   }
 
   /**
