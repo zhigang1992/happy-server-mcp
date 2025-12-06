@@ -25,7 +25,7 @@ import {
   libsodiumEncryptForPublicKey
 } from './encryption.js';
 
-const DEFAULT_SERVER_URL = 'https://happy.engineering';
+const DEFAULT_SERVER_URL = 'https://api.cluster-fluster.com';
 
 export class HappyClient {
   private credentials: Credentials;
@@ -298,6 +298,8 @@ export class HappyClient {
     const encrypted = encodeBase64(encrypt(key, variant, content));
 
     return new Promise((resolve) => {
+      let resolved = false;
+
       const socket = io(this.serverUrl, {
         auth: {
           token: this.credentials.token,
@@ -309,37 +311,39 @@ export class HappyClient {
         timeout: 10000
       });
 
-      const timeout = setTimeout(() => {
+      const cleanup = (result: { success: boolean; error?: string }) => {
+        if (resolved) return;
+        resolved = true;
         socket.disconnect();
-        resolve({ success: false, error: 'Connection timeout' });
+        resolve(result);
+      };
+
+      const timeout = setTimeout(() => {
+        cleanup({ success: false, error: 'Connection timeout' });
       }, 10000);
 
       socket.on('connect', () => {
         socket.emit('message', {
           sid: sessionId,
           message: encrypted,
-          sentFrom: 'mcp',
-          permissionMode: 'bypassPermissions'
+          localId: `mcp-${Date.now()}`
         });
 
         // Give time for the message to be sent
         setTimeout(() => {
           clearTimeout(timeout);
-          socket.disconnect();
-          resolve({ success: true });
-        }, 500);
+          cleanup({ success: true });
+        }, 1000);
       });
 
       socket.on('connect_error', (error) => {
         clearTimeout(timeout);
-        socket.disconnect();
-        resolve({ success: false, error: error.message });
+        cleanup({ success: false, error: `Connection error: ${error.message}` });
       });
 
-      socket.on('error', (error) => {
+      socket.on('error', (error: { message?: string }) => {
         clearTimeout(timeout);
-        socket.disconnect();
-        resolve({ success: false, error: String(error) });
+        cleanup({ success: false, error: `Socket error: ${error.message || String(error)}` });
       });
     });
   }
