@@ -1,0 +1,50 @@
+{
+  "name": "@zhigang1992/happy-server-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for Happy AI session management - query sessions, send messages, and read responses",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "happy-server-mcp": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zhigang1992/happy-server-mcp.git"
+  },
+  "keywords": [
+    "mcp",
+    "happy",
+    "ai",
+    "claude",
+    "codex",
+    "session"
+  ],
+  "author": "zhigang1992",
+  "license": "MIT",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/zhigang1992/happy-server-mcp/issues"
+  },
+  "homepage": "https://github.com/zhigang1992/happy-server-mcp#readme",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "socket.io-client": "^4.8.1",
+    "tweetnacl": "^1.0.3",
+    "zod": "^3.24.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "typescript": "^5.7.3"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}
