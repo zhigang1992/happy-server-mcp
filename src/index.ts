@@ -10,7 +10,7 @@ const serverUrl = process.env.HAPPY_SERVER_URL || 'https://happy.engineering';
 async function main() {
   const server = new McpServer({
     name: 'happy-server-mcp',
-    version: '0.3.0',
+    version: '0.3.1',
   });
 
   let client: HappyClient | null = null;
@@ -108,6 +108,54 @@ async function main() {
             {
               type: 'text' as const,
               text: `Error listing machines: ${error instanceof Error ? error.message : String(error)}`
+            }
+          ],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // List recent paths tool
+  server.tool(
+    'happy_list_recent_paths',
+    'List recently used folder paths for a machine. Useful for starting sessions in familiar locations.',
+    {
+      machine_id: z.string().describe('The machine ID to get recent paths for'),
+      limit: z.number().optional().describe('Maximum number of paths to return (default: 20)')
+    },
+    async ({ machine_id, limit }) => {
+      try {
+        const happyClient = await getClient();
+        const paths = await happyClient.getRecentPaths(machine_id, limit ?? 20);
+
+        if (paths.length === 0) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `No recent paths found for machine ${machine_id}.`
+              }
+            ]
+          };
+        }
+
+        const formatted = paths.map((path, index) => `${index + 1}. ${path}`).join('\n');
+
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Recent paths for machine ${machine_id}:\n\n${formatted}`
+            }
+          ]
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Error listing recent paths: ${error instanceof Error ? error.message : String(error)}`
             }
           ],
           isError: true

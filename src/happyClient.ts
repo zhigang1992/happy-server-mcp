@@ -259,6 +259,71 @@ export class HappyClient {
   }
 
   /**
+   * Get recent paths for a machine
+   * Combines paths from settings (recentMachinePaths) and session metadata
+   */
+  async getRecentPaths(machineId: string, limit: number = 20): Promise<string[]> {
+    const { key, variant } = this.getEncryption();
+    const pathSet = new Set<string>();
+    const paths: string[] = [];
+
+    // First, try to get recentMachinePaths from account settings
+    try {
+      const settingsResponse = await fetch(`${this.serverUrl}/v1/account/settings`, {
+        headers: {
+          'Authorization': `Bearer ${this.credentials.token}`,
+          'Content-Type': 'application/json'
+        }
+      });
+
+      if (settingsResponse.ok) {
+        const settingsData = await settingsResponse.json() as { settings: string | null };
+        if (settingsData.settings) {
+          const decryptedSettings = decrypt(key, variant, decodeBase64(settingsData.settings)) as {
+            recentMachinePaths?: Array<{ machineId: string; path: string }>;
+          } | null;
+
+          if (decryptedSettings?.recentMachinePaths) {
+            for (const entry of decryptedSettings.recentMachinePaths) {
+              if (entry.machineId === machineId && !pathSet.has(entry.path)) {
+                paths.push(entry.path);
+                pathSet.add(entry.path);
+              }
+            }
+          }
+        }
+      }
+    } catch {
+      // Ignore settings errors, continue with session paths
+    }
+
+    // Then add paths from sessions for this machine
+    try {
+      const sessions = await this.listSessions(100);
+      const sessionPaths: Array<{ path: string; activeAt: number }> = [];
+
+      for (const session of sessions) {
+        if (session.machineId === machineId && session.path && !pathSet.has(session.path)) {
+          pathSet.add(session.path);
+          sessionPaths.push({
+            path: session.path,
+            activeAt: session.activeAt
+          });
+        }
+      }
+
+      // Sort by most recent and add to paths
+      sessionPaths
+        .sort((a, b) => b.activeAt - a.activeAt)
+        .forEach(item => paths.push(item.path));
+    } catch {
+      // Ignore session errors
+    }
+
+    return paths.slice(0, limit);
+  }
+
+  /**
    * Archive (kill) a session
    */
   async archiveSession(sessionId: string): Promise<{ success: boolean; error?: string }> {
