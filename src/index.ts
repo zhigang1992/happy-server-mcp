@@ -5,7 +5,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { HappyClient } from './happyClient.js';
 
-const serverUrl = process.env.HAPPY_SERVER_URL || 'https://happy.engineering';
+const serverUrl = process.env.HAPPY_SERVER_URL || 'https://happy-server.reily.app';
 
 async function main() {
   const server = new McpServer({
@@ -398,6 +398,239 @@ async function main() {
             {
               type: 'text' as const,
               text: `Error waiting for idle: ${error instanceof Error ? error.message : String(error)}`
+            }
+          ],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // List Zen todos tool
+  server.tool(
+    'happy_zen_list_todos',
+    'List Zen (todo) items with titles, descriptions, and completion status.',
+    {},
+    async () => {
+      try {
+        const happyClient = await getClient();
+        const { todos } = await happyClient.listTodos();
+
+        if (todos.length === 0) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: 'No todos found.'
+              }
+            ]
+          };
+        }
+
+        const formatted = todos.map((todo, index) => {
+          const status = todo.done ? '✅ Done' : '🟡 Open';
+          const title = todo.title || '(untitled)';
+          const text = todo.text?.trim() ? `\n  Description: ${todo.text}` : '';
+          return `${index + 1}. ${status} [${todo.id}]\n  Title: ${title}${text}`;
+        }).join('\n\n');
+
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Found ${todos.length} todos:\n\n${formatted}`
+            }
+          ]
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Error listing todos: ${error instanceof Error ? error.message : String(error)}`
+            }
+          ],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // Create Zen todo tool
+  server.tool(
+    'happy_zen_create_todo',
+    'Create a new Zen (todo) item with a title and optional description.',
+    {
+      title: z.string().describe('Todo title'),
+      text: z.string().optional().describe('Optional todo description/details')
+    },
+    async ({ title, text }) => {
+      try {
+        const happyClient = await getClient();
+        const todo = await happyClient.createTodo(title, text);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Todo created.\n\nID: ${todo.id}\nTitle: ${todo.title}${todo.text ? `\nDescription: ${todo.text}` : ''}`
+            }
+          ]
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Error creating todo: ${error instanceof Error ? error.message : String(error)}`
+            }
+          ],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // Update Zen todo tool
+  server.tool(
+    'happy_zen_update_todo',
+    'Update a Zen (todo) item title and/or description.',
+    {
+      id: z.string().describe('Todo ID'),
+      title: z.string().optional().describe('Updated title'),
+      text: z.string().optional().describe('Updated description/details')
+    },
+    async ({ id, title, text }) => {
+      try {
+        if (title === undefined && text === undefined) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: 'No updates provided. Specify title and/or text.'
+              }
+            ],
+            isError: true
+          };
+        }
+
+        const happyClient = await getClient();
+        const todo = await happyClient.updateTodo(id, { title, text });
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Todo updated.\n\nID: ${todo.id}\nTitle: ${todo.title}${todo.text ? `\nDescription: ${todo.text}` : ''}`
+            }
+          ]
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Error updating todo: ${error instanceof Error ? error.message : String(error)}`
+            }
+          ],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // Toggle/set Zen todo done status tool
+  server.tool(
+    'happy_zen_set_todo_done',
+    'Set or toggle a Zen (todo) item completion status.',
+    {
+      id: z.string().describe('Todo ID'),
+      done: z.boolean().optional().describe('If provided, set to done/undone; otherwise toggles')
+    },
+    async ({ id, done }) => {
+      try {
+        const happyClient = await getClient();
+        const todo = await happyClient.setTodoDone(id, done);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Todo ${todo.done ? 'completed' : 'reopened'}.\n\nID: ${todo.id}\nTitle: ${todo.title}`
+            }
+          ]
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Error updating todo status: ${error instanceof Error ? error.message : String(error)}`
+            }
+          ],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // Delete Zen todo tool
+  server.tool(
+    'happy_zen_delete_todo',
+    'Delete a Zen (todo) item.',
+    {
+      id: z.string().describe('Todo ID')
+    },
+    async ({ id }) => {
+      try {
+        const happyClient = await getClient();
+        await happyClient.deleteTodo(id);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Todo ${id} deleted.`
+            }
+          ]
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Error deleting todo: ${error instanceof Error ? error.message : String(error)}`
+            }
+          ],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // Link Zen todo to a session tool
+  server.tool(
+    'happy_zen_link_session',
+    'Link a Zen (todo) item to a Happy session with a display title.',
+    {
+      id: z.string().describe('Todo ID'),
+      session_id: z.string().describe('Session ID to link'),
+      display_title: z.string().describe('Display title for the linked session')
+    },
+    async ({ id, session_id, display_title }) => {
+      try {
+        const happyClient = await getClient();
+        const todo = await happyClient.linkTodoToSession(id, session_id, display_title);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Session linked.\n\nTodo ID: ${todo.id}\nTitle: ${todo.title}\nSession: ${session_id}`
+            }
+          ]
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Error linking session: ${error instanceof Error ? error.message : String(error)}`
             }
           ],
           isError: true

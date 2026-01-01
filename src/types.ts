@@ -22,6 +22,7 @@ export interface Credentials {
     dataKeySeed: Uint8Array;
     machineKey: Uint8Array;
   };
+  legacySecret?: Uint8Array;
 }
 
 // Session metadata (matches MetadataSchema from Happy app)

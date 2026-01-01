@@ -1,4 +1,5 @@
 import { readFile, stat } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { io, Socket } from 'socket.io-client';
@@ -24,17 +25,58 @@ import {
   encodeBase64,
   encrypt,
   decrypt,
-  EncryptionVariant,
-  derivePublicKeyFromSeed,
-  libsodiumEncryptForPublicKey
+  EncryptionVariant
 } from './encryption.js';
 
-const DEFAULT_SERVER_URL = 'https://happy.engineering';
+const DEFAULT_SERVER_URL = 'https://happy-server.reily.app';
 
 // For self-hosted setups, you can override via HAPPY_SERVER_URL env var
 // Common servers:
 // - Production: https://api.cluster-fluster.com
 // - Self-hosted example: https://happy-server.reily.app
+
+interface KvItem {
+  key: string;
+  value: string;
+  version: number;
+}
+
+interface KvMutation {
+  key: string;
+  value: string | null;
+  version: number;
+}
+
+interface KvMutateSuccessResponse {
+  success: true;
+  results: Array<{ key: string; version: number }>;
+}
+
+interface KvMutateErrorResponse {
+  success: false;
+  errors: Array<{ key: string; error: 'version-mismatch'; version: number; value: string | null }>;
+}
+
+type KvMutateResponse = KvMutateSuccessResponse | KvMutateErrorResponse;
+
+interface TodoItem {
+  id: string;
+  title: string;
+  text?: string;
+  done: boolean;
+  createdAt: number;
+  updatedAt: number;
+  completedAt?: number;
+  linkedSessions?: Record<string, { title: string; linkedAt: number }>;
+}
+
+interface TodoIndex {
+  undoneOrder: string[];
+  completedOrder: string[];
+}
+
+const TODO_PREFIX = 'todo.';
+const TODO_INDEX_KEY = 'todo.index';
 
 export class HappyClient {
   private credentials: Credentials;
@@ -73,21 +115,26 @@ export class HappyClient {
       const content = await readFile(keyFile, 'utf8');
       const parsed = CredentialsFileSchema.parse(JSON.parse(content));
 
-      if (parsed.secret) {
-        return {
-          token: parsed.token,
-          encryption: {
-            type: 'legacy',
-            secret: decodeBase64(parsed.secret)
-          }
-        };
-      } else if (parsed.encryption) {
+      const legacySecret = parsed.secret ? decodeBase64(parsed.secret) : undefined;
+
+      if (parsed.encryption) {
         return {
           token: parsed.token,
           encryption: {
             type: 'dataKey',
             dataKeySeed: decodeBase64(parsed.encryption.publicKey),
             machineKey: decodeBase64(parsed.encryption.machineKey)
+          },
+          legacySecret
+        };
+      }
+
+      if (legacySecret) {
+        return {
+          token: parsed.token,
+          encryption: {
+            type: 'legacy',
+            secret: legacySecret
           }
         };
       }
@@ -115,13 +162,28 @@ export class HappyClient {
     }
   }
 
+  private getLegacySecret(): Uint8Array | null {
+    if (this.credentials.encryption.type === 'legacy') {
+      return this.credentials.encryption.secret;
+    }
+    return this.credentials.legacySecret ?? null;
+  }
+
   /**
    * Decrypt session metadata
    */
   private decryptMetadata(encrypted: string, key: Uint8Array, variant: EncryptionVariant): SessionMetadata | null {
     try {
       const decoded = decodeBase64(encrypted);
-      return decrypt(key, variant, decoded) as SessionMetadata | null;
+      const primary = decrypt(key, variant, decoded) as SessionMetadata | null;
+      if (primary) {
+        return primary;
+      }
+      const legacySecret = this.getLegacySecret();
+      if (legacySecret && variant !== 'legacy') {
+        return decrypt(legacySecret, 'legacy', decoded) as SessionMetadata | null;
+      }
+      return null;
     } catch {
       return null;
     }
@@ -133,7 +195,15 @@ export class HappyClient {
   private decryptMessage(encrypted: string, key: Uint8Array, variant: EncryptionVariant): MessageContent | null {
     try {
       const decoded = decodeBase64(encrypted);
-      return decrypt(key, variant, decoded) as MessageContent | null;
+      const primary = decrypt(key, variant, decoded) as MessageContent | null;
+      if (primary) {
+        return primary;
+      }
+      const legacySecret = this.getLegacySecret();
+      if (legacySecret && variant !== 'legacy') {
+        return decrypt(legacySecret, 'legacy', decoded) as MessageContent | null;
+      }
+      return null;
     } catch {
       return null;
     }
@@ -321,6 +391,424 @@ export class HappyClient {
     }
 
     return paths.slice(0, limit);
+  }
+
+  private getTodoKey(id: string): string {
+    return `${TODO_PREFIX}${id}`;
+  }
+
+  private encryptTodoData(data: unknown): string {
+    const legacySecret = this.getLegacySecret();
+    if (!legacySecret) {
+      throw new Error('Legacy secret not available; cannot encrypt Zen todos.');
+    }
+    const encrypted = encrypt(legacySecret, 'legacy', data);
+    return encodeBase64(encrypted);
+  }
+
+  private decryptTodoData(encrypted: string): unknown | null {
+    const legacySecret = this.getLegacySecret();
+    if (!legacySecret) {
+      return null;
+    }
+    const decoded = decodeBase64(encrypted);
+    return decrypt(legacySecret, 'legacy', decoded);
+  }
+
+  async kvGet(key: string): Promise<KvItem | null> {
+    const response = await fetch(`${this.serverUrl}/v1/kv/${encodeURIComponent(key)}`, {
+      headers: {
+        'Authorization': `Bearer ${this.credentials.token}`,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    if (response.status === 404) {
+      return null;
+    }
+
+    if (!response.ok) {
+      throw new Error(`Failed to get KV value: ${response.status} ${response.statusText}`);
+    }
+
+    return await response.json() as KvItem;
+  }
+
+  async kvList(params: { prefix?: string; limit?: number } = {}): Promise<{ items: KvItem[] }> {
+    const queryParams = new URLSearchParams();
+    if (params.prefix) {
+      queryParams.append('prefix', params.prefix);
+    }
+    if (params.limit !== undefined) {
+      queryParams.append('limit', params.limit.toString());
+    }
+
+    const url = queryParams.toString()
+      ? `${this.serverUrl}/v1/kv?${queryParams.toString()}`
+      : `${this.serverUrl}/v1/kv`;
+
+    const response = await fetch(url, {
+      headers: {
+        'Authorization': `Bearer ${this.credentials.token}`,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to list KV items: ${response.status} ${response.statusText}`);
+    }
+
+    return await response.json() as { items: KvItem[] };
+  }
+
+  async kvBulkGet(keys: string[]): Promise<{ values: KvItem[] }> {
+    const response = await fetch(`${this.serverUrl}/v1/kv/bulk`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${this.credentials.token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ keys })
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to bulk get KV values: ${response.status} ${response.statusText}`);
+    }
+
+    return await response.json() as { values: KvItem[] };
+  }
+
+  async kvMutate(mutations: KvMutation[]): Promise<KvMutateResponse> {
+    const response = await fetch(`${this.serverUrl}/v1/kv`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${this.credentials.token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ mutations })
+    });
+
+    if (response.status === 409) {
+      return await response.json() as KvMutateErrorResponse;
+    }
+
+    if (!response.ok) {
+      throw new Error(`Failed to mutate KV values: ${response.status} ${response.statusText}`);
+    }
+
+    return await response.json() as KvMutateSuccessResponse;
+  }
+
+  async listTodos(): Promise<{ todos: TodoItem[]; undoneOrder: string[]; doneOrder: string[] }> {
+    const response = await this.kvList({ prefix: TODO_PREFIX, limit: 1000 });
+    const todoMap = new Map<string, TodoItem>();
+    let index: TodoIndex = { undoneOrder: [], completedOrder: [] };
+
+    for (const item of response.items) {
+      if (item.key === TODO_INDEX_KEY) {
+        const decrypted = this.decryptTodoData(item.value);
+        if (decrypted) {
+          index = decrypted as TodoIndex;
+        }
+        continue;
+      }
+
+      if (!item.key.startsWith(TODO_PREFIX) || item.key === TODO_INDEX_KEY) {
+        continue;
+      }
+
+      const decrypted = this.decryptTodoData(item.value);
+      if (!decrypted) {
+        continue;
+      }
+
+      const todoId = item.key.substring(TODO_PREFIX.length);
+      if (todoId && todoId !== 'index') {
+        todoMap.set(todoId, decrypted as TodoItem);
+      }
+    }
+
+    const undoneOrder = index.undoneOrder || [];
+    const doneOrder = index.completedOrder || [];
+    const orderedTodos: TodoItem[] = [];
+    const orderedIds = new Set<string>();
+
+    const pushTodo = (id: string) => {
+      const todo = todoMap.get(id);
+      if (todo) {
+        orderedTodos.push(todo);
+        orderedIds.add(id);
+      }
+    };
+
+    for (const id of undoneOrder) {
+      pushTodo(id);
+    }
+    for (const id of doneOrder) {
+      pushTodo(id);
+    }
+
+    for (const [id, todo] of todoMap.entries()) {
+      if (!orderedIds.has(id)) {
+        orderedTodos.push(todo);
+      }
+    }
+
+    return { todos: orderedTodos, undoneOrder, doneOrder };
+  }
+
+  async createTodo(title: string, text?: string): Promise<TodoItem> {
+    const id = randomUUID();
+    const now = Date.now();
+    const newTodo: TodoItem = {
+      id,
+      title,
+      text,
+      done: false,
+      createdAt: now,
+      updatedAt: now,
+      linkedSessions: {}
+    };
+
+    const indexResponse = await this.kvGet(TODO_INDEX_KEY);
+    let currentIndex: TodoIndex = { undoneOrder: [], completedOrder: [] };
+    let indexVersion = -1;
+
+    if (indexResponse) {
+      indexVersion = indexResponse.version;
+      const decrypted = this.decryptTodoData(indexResponse.value);
+      if (decrypted) {
+        currentIndex = decrypted as TodoIndex;
+      }
+    }
+
+    const mergedIndex: TodoIndex = {
+      undoneOrder: (currentIndex.undoneOrder || []).includes(id)
+        ? (currentIndex.undoneOrder || [])
+        : [...(currentIndex.undoneOrder || []), id],
+      completedOrder: (currentIndex.completedOrder || []).filter(tid => tid !== id)
+    };
+
+    const mutations: KvMutation[] = [
+      {
+        key: this.getTodoKey(id),
+        value: this.encryptTodoData(newTodo),
+        version: -1
+      },
+      {
+        key: TODO_INDEX_KEY,
+        value: this.encryptTodoData(mergedIndex),
+        version: indexVersion
+      }
+    ];
+
+    const result = await this.kvMutate(mutations);
+    if (result.success === false) {
+      const details = result.errors.map(err => `${err.key} (${err.error})`).join(', ');
+      throw new Error(`Todo create failed due to version mismatch: ${details}`);
+    }
+
+    return newTodo;
+  }
+
+  async updateTodo(
+    id: string,
+    updates: { title?: string; text?: string }
+  ): Promise<TodoItem> {
+    const todoKey = this.getTodoKey(id);
+    const todoResponse = await this.kvGet(todoKey);
+    if (!todoResponse) {
+      throw new Error(`Todo ${id} not found.`);
+    }
+
+    const decrypted = this.decryptTodoData(todoResponse.value);
+    if (!decrypted) {
+      throw new Error(`Failed to decrypt todo ${id}.`);
+    }
+
+    const now = Date.now();
+    const updatedTodo: TodoItem = {
+      ...(decrypted as TodoItem),
+      ...(updates.title !== undefined ? { title: updates.title } : {}),
+      ...(updates.text !== undefined ? { text: updates.text } : {}),
+      updatedAt: now
+    };
+
+    const result = await this.kvMutate([{
+      key: todoKey,
+      value: this.encryptTodoData(updatedTodo),
+      version: todoResponse.version
+    }]);
+
+    if (result.success === false) {
+      const details = result.errors.map(err => `${err.key} (${err.error})`).join(', ');
+      throw new Error(`Todo update failed due to version mismatch: ${details}`);
+    }
+
+    return updatedTodo;
+  }
+
+  async setTodoDone(id: string, done?: boolean): Promise<TodoItem> {
+    const todoKey = this.getTodoKey(id);
+    const [todoResponse, indexResponse] = await Promise.all([
+      this.kvGet(todoKey),
+      this.kvGet(TODO_INDEX_KEY)
+    ]);
+
+    if (!todoResponse) {
+      throw new Error(`Todo ${id} not found.`);
+    }
+
+    const decryptedTodo = this.decryptTodoData(todoResponse.value);
+    if (!decryptedTodo) {
+      throw new Error(`Failed to decrypt todo ${id}.`);
+    }
+
+    let currentIndex: TodoIndex = { undoneOrder: [], completedOrder: [] };
+    let indexVersion = -1;
+
+    if (indexResponse) {
+      indexVersion = indexResponse.version;
+      const decryptedIndex = this.decryptTodoData(indexResponse.value);
+      if (decryptedIndex) {
+        currentIndex = decryptedIndex as TodoIndex;
+      }
+    }
+
+    const now = Date.now();
+    const todo = decryptedTodo as TodoItem;
+    const nextDone = done ?? !todo.done;
+    const updatedTodo: TodoItem = {
+      ...todo,
+      done: nextDone,
+      updatedAt: now,
+      completedAt: nextDone ? now : undefined
+    };
+
+    const newUndoneOrder = (currentIndex.undoneOrder || []).filter(tid => tid !== id);
+    const newCompletedOrder = (currentIndex.completedOrder || []).filter(tid => tid !== id);
+
+    if (nextDone) {
+      newCompletedOrder.unshift(id);
+    } else {
+      newUndoneOrder.push(id);
+    }
+
+    const mergedIndex: TodoIndex = {
+      undoneOrder: newUndoneOrder,
+      completedOrder: newCompletedOrder
+    };
+
+    const result = await this.kvMutate([
+      {
+        key: todoKey,
+        value: this.encryptTodoData(updatedTodo),
+        version: todoResponse.version
+      },
+      {
+        key: TODO_INDEX_KEY,
+        value: this.encryptTodoData(mergedIndex),
+        version: indexVersion
+      }
+    ]);
+
+    if (result.success === false) {
+      const details = result.errors.map(err => `${err.key} (${err.error})`).join(', ');
+      throw new Error(`Todo toggle failed due to version mismatch: ${details}`);
+    }
+
+    return updatedTodo;
+  }
+
+  async deleteTodo(id: string): Promise<void> {
+    const todoKey = this.getTodoKey(id);
+    const [todoResponse, indexResponse] = await Promise.all([
+      this.kvGet(todoKey),
+      this.kvGet(TODO_INDEX_KEY)
+    ]);
+
+    if (!todoResponse) {
+      throw new Error(`Todo ${id} not found.`);
+    }
+
+    let currentIndex: TodoIndex = { undoneOrder: [], completedOrder: [] };
+    let indexVersion = -1;
+
+    if (indexResponse) {
+      indexVersion = indexResponse.version;
+      const decryptedIndex = this.decryptTodoData(indexResponse.value);
+      if (decryptedIndex) {
+        currentIndex = decryptedIndex as TodoIndex;
+      }
+    }
+
+    const mergedIndex: TodoIndex = {
+      undoneOrder: (currentIndex.undoneOrder || []).filter(tid => tid !== id),
+      completedOrder: (currentIndex.completedOrder || []).filter(tid => tid !== id)
+    };
+
+    const result = await this.kvMutate([
+      {
+        key: todoKey,
+        value: null,
+        version: todoResponse.version
+      },
+      {
+        key: TODO_INDEX_KEY,
+        value: this.encryptTodoData(mergedIndex),
+        version: indexVersion
+      }
+    ]);
+
+    if (result.success === false) {
+      const details = result.errors.map(err => `${err.key} (${err.error})`).join(', ');
+      throw new Error(`Todo delete failed due to version mismatch: ${details}`);
+    }
+  }
+
+  async linkTodoToSession(
+    id: string,
+    sessionId: string,
+    displayTitle: string
+  ): Promise<TodoItem> {
+    const todoKey = this.getTodoKey(id);
+    const todoResponse = await this.kvGet(todoKey);
+    if (!todoResponse) {
+      throw new Error(`Todo ${id} not found.`);
+    }
+
+    const decrypted = this.decryptTodoData(todoResponse.value);
+    if (!decrypted) {
+      throw new Error(`Failed to decrypt todo ${id}.`);
+    }
+
+    const todo = decrypted as TodoItem;
+    const linkedSessions = {
+      ...(todo.linkedSessions || {}),
+      [sessionId]: {
+        title: displayTitle,
+        linkedAt: Date.now()
+      }
+    };
+
+    const updatedTodo: TodoItem = {
+      ...todo,
+      linkedSessions,
+      updatedAt: Date.now()
+    };
+
+    const result = await this.kvMutate([{
+      key: todoKey,
+      value: this.encryptTodoData(updatedTodo),
+      version: todoResponse.version
+    }]);
+
+    if (result.success === false) {
+      const details = result.errors.map(err => `${err.key} (${err.error})`).join(', ');
+      throw new Error(`Todo link failed due to version mismatch: ${details}`);
+    }
+
+    return updatedTodo;
   }
 
   /**
