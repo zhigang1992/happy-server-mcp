@@ -25,7 +25,10 @@ import {
   encodeBase64,
   encrypt,
   decrypt,
-  EncryptionVariant
+  EncryptionVariant,
+  deriveContentKeyPair,
+  decryptDataEncryptionKey,
+  encryptWithDataKey
 } from './encryption.js';
 
 const DEFAULT_SERVER_URL = 'https://happy-server.reily.app';
@@ -82,10 +85,13 @@ export class HappyClient {
   private credentials: Credentials;
   private serverUrl: string;
   private socket: Socket | null = null;
+  private contentSecretKey: Uint8Array; // For decrypting session data encryption keys
+  private sessionEncryptionKeys: Map<string, Uint8Array> = new Map(); // Cache of decrypted session keys
 
-  private constructor(credentials: Credentials, serverUrl: string) {
+  private constructor(credentials: Credentials, serverUrl: string, contentSecretKey: Uint8Array) {
     this.credentials = credentials;
     this.serverUrl = serverUrl;
+    this.contentSecretKey = contentSecretKey;
   }
 
   /**
@@ -96,7 +102,14 @@ export class HappyClient {
     if (!credentials) {
       throw new Error('No Happy credentials found. Please run `happy auth` first.');
     }
-    return new HappyClient(credentials, serverUrl ?? DEFAULT_SERVER_URL);
+
+    // Derive the content key pair from the master secret for decrypting session data encryption keys
+    const masterSecret = credentials.encryption.type === 'legacy'
+      ? credentials.encryption.secret
+      : credentials.encryption.machineKey;
+    const contentKeyPair = deriveContentKeyPair(masterSecret);
+
+    return new HappyClient(credentials, serverUrl ?? DEFAULT_SERVER_URL, contentKeyPair.secretKey);
   }
 
   /**
@@ -167,6 +180,64 @@ export class HappyClient {
       return this.credentials.encryption.secret;
     }
     return this.credentials.legacySecret ?? null;
+  }
+
+  /**
+   * Get or fetch the session-specific encryption key
+   * Sessions use per-session AES-256 data encryption keys that must be decrypted
+   * using the content key pair before use
+   */
+  private async getSessionEncryptionKey(sessionId: string): Promise<Uint8Array | null> {
+    // Check cache first
+    const cached = this.sessionEncryptionKeys.get(sessionId);
+    if (cached) {
+      return cached;
+    }
+
+    // Fetch session details to get the dataEncryptionKey
+    try {
+      const response = await fetch(`${this.serverUrl}/v1/sessions`, {
+        headers: {
+          'Authorization': `Bearer ${this.credentials.token}`,
+          'Content-Type': 'application/json'
+        }
+      });
+
+      if (!response.ok) {
+        console.error(`Failed to fetch sessions: ${response.status}`);
+        return null;
+      }
+
+      const data = await response.json() as { sessions: ApiSession[] };
+      const session = data.sessions.find(s => s.id === sessionId);
+
+      if (!session) {
+        console.error(`Session ${sessionId} not found`);
+        return null;
+      }
+
+      if (!session.dataEncryptionKey) {
+        // Session uses legacy encryption, not per-session keys
+        // Fall back to the account-level key
+        return null;
+      }
+
+      // Decrypt the session's data encryption key
+      const encryptedKey = decodeBase64(session.dataEncryptionKey);
+      const decryptedKey = decryptDataEncryptionKey(encryptedKey, this.contentSecretKey);
+
+      if (!decryptedKey) {
+        console.error(`Failed to decrypt data encryption key for session ${sessionId}`);
+        return null;
+      }
+
+      // Cache the decrypted key
+      this.sessionEncryptionKeys.set(sessionId, decryptedKey);
+      return decryptedKey;
+    } catch (error) {
+      console.error(`Error fetching session encryption key: ${error}`);
+      return null;
+    }
   }
 
   /**
@@ -1126,8 +1197,6 @@ export class HappyClient {
    * @param wait - If true, wait for AI to finish processing the message
    */
   async sendMessage(sessionId: string, text: string, wait: boolean = false): Promise<{ success: boolean; error?: string }> {
-    const { key, variant } = this.getEncryption();
-
     // Create user message content
     const content: UserMessageContent = {
       role: 'user',
@@ -1141,8 +1210,18 @@ export class HappyClient {
       }
     };
 
-    // Encrypt the message
-    const encrypted = encodeBase64(encrypt(key, variant, content));
+    // Get session-specific encryption key (per-session AES-256)
+    // If not available, fall back to legacy/account-level encryption
+    const sessionKey = await this.getSessionEncryptionKey(sessionId);
+    let encrypted: string;
+    if (sessionKey) {
+      // Use per-session AES-256-GCM encryption (this is what the frontend uses)
+      encrypted = encodeBase64(encryptWithDataKey(content, sessionKey));
+    } else {
+      // Fall back to legacy encryption
+      const { key, variant } = this.getEncryption();
+      encrypted = encodeBase64(encrypt(key, variant, content));
+    }
 
     const sendResult = await new Promise<{ success: boolean; error?: string }>((resolve) => {
       let resolved = false;

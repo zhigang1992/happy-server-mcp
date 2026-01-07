@@ -1,5 +1,81 @@
-import { createCipheriv, createDecipheriv, randomBytes, createHash } from 'node:crypto';
+import { createCipheriv, createDecipheriv, randomBytes, createHash, createHmac } from 'node:crypto';
 import tweetnacl from 'tweetnacl';
+
+/**
+ * HMAC-SHA512 for key derivation
+ */
+function hmac_sha512(key: Uint8Array, data: Uint8Array): Uint8Array {
+  const hmac = createHmac('sha512', key);
+  hmac.update(data);
+  return new Uint8Array(hmac.digest());
+}
+
+/**
+ * Key tree state for hierarchical key derivation
+ */
+interface KeyTreeState {
+  key: Uint8Array;
+  chainCode: Uint8Array;
+}
+
+/**
+ * Derive the root of a secret key tree from a seed
+ */
+function deriveSecretKeyTreeRoot(seed: Uint8Array, usage: string): KeyTreeState {
+  const I = hmac_sha512(new TextEncoder().encode(usage + ' Master Seed'), seed);
+  return {
+    key: I.slice(0, 32),
+    chainCode: I.slice(32)
+  };
+}
+
+/**
+ * Derive a child key from a parent chain code
+ */
+function deriveSecretKeyTreeChild(chainCode: Uint8Array, index: string): KeyTreeState {
+  const data = new Uint8Array([0x0, ...new TextEncoder().encode(index)]);
+  const I = hmac_sha512(chainCode, data);
+  return {
+    key: I.slice(0, 32),
+    chainCode: I.slice(32)
+  };
+}
+
+/**
+ * Derive a key from a master secret following a path
+ */
+export function deriveKey(master: Uint8Array, usage: string, path: string[]): Uint8Array {
+  let state = deriveSecretKeyTreeRoot(master, usage);
+  for (const index of path) {
+    state = deriveSecretKeyTreeChild(state.chainCode, index);
+  }
+  return state.key;
+}
+
+/**
+ * Derive content key pair from master secret (for decrypting session data encryption keys)
+ */
+export function deriveContentKeyPair(masterSecret: Uint8Array): tweetnacl.BoxKeyPair {
+  const contentDataKey = deriveKey(masterSecret, 'Happy EnCoder', ['content']);
+  return tweetnacl.box.keyPair.fromSecretKey(contentDataKey);
+}
+
+/**
+ * Decrypt a data encryption key using the content key pair
+ * The encrypted key has format: version(1) + ephemeral_public_key(32) + nonce(24) + ciphertext
+ */
+export function decryptDataEncryptionKey(encrypted: Uint8Array, contentSecretKey: Uint8Array): Uint8Array | null {
+  if (encrypted.length < 1) return null;
+  if (encrypted[0] !== 0) return null; // Version check
+
+  const bundle = encrypted.slice(1);
+  const ephemeralPublicKey = bundle.slice(0, tweetnacl.box.publicKeyLength);
+  const nonce = bundle.slice(tweetnacl.box.publicKeyLength, tweetnacl.box.publicKeyLength + tweetnacl.box.nonceLength);
+  const ciphertext = bundle.slice(tweetnacl.box.publicKeyLength + tweetnacl.box.nonceLength);
+
+  const decrypted = tweetnacl.box.open(ciphertext, nonce, ephemeralPublicKey, contentSecretKey);
+  return decrypted ?? null;
+}
 
 /**
  * Encode a Uint8Array to base64 string
