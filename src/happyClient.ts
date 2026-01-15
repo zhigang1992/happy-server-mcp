@@ -73,6 +73,13 @@ interface TodoItem {
   linkedSessions?: Record<string, { title: string; linkedAt: number }>;
 }
 
+export interface EnvironmentSet {
+  id: string;
+  name: string;
+  variables: Record<string, string>;
+  isDefault?: boolean;
+}
+
 interface TodoIndex {
   undoneOrder: string[];
   completedOrder: string[];
@@ -462,6 +469,40 @@ export class HappyClient {
     }
 
     return paths.slice(0, limit);
+  }
+
+  /**
+   * Get environment variable sets from account settings
+   * These are named presets that can be used when starting sessions
+   */
+  async getEnvironmentSets(): Promise<EnvironmentSet[]> {
+    const { key, variant } = this.getEncryption();
+
+    try {
+      const settingsResponse = await fetch(`${this.serverUrl}/v1/account/settings`, {
+        headers: {
+          'Authorization': `Bearer ${this.credentials.token}`,
+          'Content-Type': 'application/json'
+        }
+      });
+
+      if (!settingsResponse.ok) {
+        return [];
+      }
+
+      const settingsData = await settingsResponse.json() as { settings: string | null };
+      if (!settingsData.settings) {
+        return [];
+      }
+
+      const decryptedSettings = decrypt(key, variant, decodeBase64(settingsData.settings)) as {
+        environmentSets?: EnvironmentSet[];
+      } | null;
+
+      return decryptedSettings?.environmentSets ?? [];
+    } catch {
+      return [];
+    }
   }
 
   private getTodoKey(id: string): string {
@@ -957,13 +998,15 @@ export class HappyClient {
   /**
    * Start a new session on a machine
    * @param wait - If true, wait for AI to finish processing initial message
+   * @param environmentVariables - Optional environment variables to pass to the session
    */
   async startSession(
     machineId: string,
     directory: string,
     message?: string,
     agent: 'claude' | 'codex' = 'claude',
-    wait: boolean = false
+    wait: boolean = false,
+    environmentVariables?: Record<string, string>
   ): Promise<{ success: boolean; sessionId?: string; error?: string }> {
     const { key, variant } = this.getEncryption();
 
@@ -995,12 +1038,22 @@ export class HappyClient {
 
       socket.on('connect', () => {
         // Encrypt the spawn params
-        const spawnParams = {
+        const spawnParams: {
+          type: 'spawn-in-directory';
+          directory: string;
+          approvedNewDirectoryCreation: boolean;
+          agent: 'claude' | 'codex';
+          environmentVariables?: Record<string, string>;
+        } = {
           type: 'spawn-in-directory',
           directory,
           approvedNewDirectoryCreation: true,
           agent
         };
+        // Only include environmentVariables if provided and non-empty
+        if (environmentVariables && Object.keys(environmentVariables).length > 0) {
+          spawnParams.environmentVariables = environmentVariables;
+        }
         const encryptedParams = encodeBase64(encrypt(key, variant, spawnParams));
 
         // Use rpc-call with the correct method format: machineId:methodName

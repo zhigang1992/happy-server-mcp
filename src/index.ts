@@ -164,6 +164,57 @@ async function main() {
     }
   );
 
+  // List environment sets tool
+  server.tool(
+    'happy_list_environment_sets',
+    'List available environment variable presets. These can be used when starting new sessions with happy_start_session.',
+    {},
+    async () => {
+      try {
+        const happyClient = await getClient();
+        const envSets = await happyClient.getEnvironmentSets();
+
+        if (envSets.length === 0) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: 'No environment presets configured. You can create them in the Happy app settings, or pass custom environment_variables directly to happy_start_session.'
+              }
+            ]
+          };
+        }
+
+        const formatted = envSets.map(set => {
+          const varCount = Object.keys(set.variables).length;
+          const varList = Object.keys(set.variables).slice(0, 5).join(', ');
+          const moreCount = varCount > 5 ? ` (+${varCount - 5} more)` : '';
+          const defaultBadge = set.isDefault ? ' [DEFAULT]' : '';
+          return `• ${set.name}${defaultBadge}\n  ID: ${set.id}\n  Variables (${varCount}): ${varList}${moreCount}`;
+        }).join('\n\n');
+
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Found ${envSets.length} environment preset${envSets.length !== 1 ? 's' : ''}:\n\n${formatted}\n\nUse the preset ID with happy_start_session's environment_preset_id parameter.`
+            }
+          ]
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Error listing environment sets: ${error instanceof Error ? error.message : String(error)}`
+            }
+          ],
+          isError: true
+        };
+      }
+    }
+  );
+
   // Read messages tool
   server.tool(
     'happy_read_messages',
@@ -262,28 +313,75 @@ async function main() {
   // Start session tool
   server.tool(
     'happy_start_session',
-    'Start a new Happy AI session on a machine. Use happy_list_machines to find available machines first.',
+    'Start a new Happy AI session on a machine. Use happy_list_machines to find available machines first. Use happy_list_environment_sets to see available environment presets.',
     {
       machine_id: z.string().describe('The machine ID to start the session on'),
       directory: z.string().describe('The directory path to run the session in'),
       message: z.string().optional().describe('Optional initial message to send to start the session working'),
       agent: z.enum(['claude', 'codex']).optional().describe('Agent type to use (default: claude)'),
-      wait: z.boolean().optional().describe('If true, wait for AI to finish processing initial message before returning (default: false)')
+      wait: z.boolean().optional().describe('If true, wait for AI to finish processing initial message before returning (default: false)'),
+      environment_preset_id: z.string().optional().describe('Optional ID of an environment preset to use (from happy_list_environment_sets). Preset variables are applied first, then custom variables override them.'),
+      environment_variables: z.record(z.string(), z.string()).optional().describe('Optional custom environment variables as key-value pairs. These override any variables from the preset.')
     },
-    async ({ machine_id, directory, message, agent, wait }) => {
+    async ({ machine_id, directory, message, agent, wait, environment_preset_id, environment_variables }) => {
       try {
         const happyClient = await getClient();
-        const result = await happyClient.startSession(machine_id, directory, message, agent ?? 'claude', wait ?? false);
+
+        // Merge environment variables: preset first, then custom overrides
+        let mergedEnvVars: Record<string, string> = {};
+
+        if (environment_preset_id) {
+          const envSets = await happyClient.getEnvironmentSets();
+          const preset = envSets.find(s => s.id === environment_preset_id);
+          if (preset) {
+            mergedEnvVars = { ...preset.variables };
+          } else {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `Environment preset not found: ${environment_preset_id}. Use happy_list_environment_sets to see available presets.`
+                }
+              ],
+              isError: true
+            };
+          }
+        }
+
+        // Custom variables override preset variables
+        if (environment_variables) {
+          mergedEnvVars = { ...mergedEnvVars, ...environment_variables };
+        }
+
+        const result = await happyClient.startSession(
+          machine_id,
+          directory,
+          message,
+          agent ?? 'claude',
+          wait ?? false,
+          Object.keys(mergedEnvVars).length > 0 ? mergedEnvVars : undefined
+        );
 
         if (result.success && result.sessionId) {
           const waitNote = (message && wait)
             ? 'AI has finished processing the initial message.'
             : (message ? 'Initial message sent. Use happy_read_messages to check session activity.' : 'Use happy_send_message to start working.');
+
+          // Build environment info for response
+          let envInfo = '';
+          if (environment_preset_id || (environment_variables && Object.keys(environment_variables).length > 0)) {
+            const envCount = Object.keys(mergedEnvVars).length;
+            envInfo = `\nEnvironment: ${envCount} variable${envCount !== 1 ? 's' : ''} configured`;
+            if (environment_preset_id) {
+              envInfo += ` (preset: ${environment_preset_id})`;
+            }
+          }
+
           return {
             content: [
               {
                 type: 'text' as const,
-                text: `Session started successfully!\n\nSession ID: ${result.sessionId}\nDirectory: ${directory}\nAgent: ${agent ?? 'claude'}${message ? `\n\nInitial message: "${message}"` : ''}\n\n${waitNote}${result.error ? `\n\nWarning: ${result.error}` : ''}`
+                text: `Session started successfully!\n\nSession ID: ${result.sessionId}\nDirectory: ${directory}\nAgent: ${agent ?? 'claude'}${envInfo}${message ? `\n\nInitial message: "${message}"` : ''}\n\n${waitNote}${result.error ? `\n\nWarning: ${result.error}` : ''}`
               }
             ]
           };
