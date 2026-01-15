@@ -9,8 +9,8 @@ const serverUrl = process.env.HAPPY_SERVER_URL || 'https://happy-server.reily.ap
 
 async function main() {
   const server = new McpServer({
-    name: 'happy-server-mcp',
-    version: '0.3.2',
+    name: 'happy-manager',
+    version: '0.3.5',
   });
 
   let client: HappyClient | null = null;

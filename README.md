@@ -36,7 +36,7 @@ Add to your Claude configuration:
 ```json
 {
   "mcpServers": {
-    "happy": {
+    "happy-manager": {
       "command": "happy-server-mcp"
     }
   }
@@ -48,7 +48,7 @@ Or with npx:
 ```json
 {
   "mcpServers": {
-    "happy": {
+    "happy-manager": {
       "command": "npx",
       "args": ["@zhigang1992/happy-server-mcp"]
     }
