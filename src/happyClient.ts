@@ -31,12 +31,12 @@ import {
   encryptWithDataKey
 } from './encryption.js';
 
-const DEFAULT_SERVER_URL = 'https://happy-server.reily.app';
+const DEFAULT_SERVER_URL = 'https://happy-server.innopals.com';
 
 // For self-hosted setups, you can override via HAPPY_SERVER_URL env var
 // Common servers:
 // - Production: https://api.cluster-fluster.com
-// - Self-hosted example: https://happy-server.reily.app
+// - Self-hosted example: https://happy-server.innopals.com
 
 interface KvItem {
   key: string;

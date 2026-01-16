@@ -5,7 +5,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { HappyClient } from './happyClient.js';
 
-const serverUrl = process.env.HAPPY_SERVER_URL || 'https://happy-server.reily.app';
+const serverUrl = process.env.HAPPY_SERVER_URL || 'https://happy-server.innopals.com';
 
 async function main() {
   const server = new McpServer({
