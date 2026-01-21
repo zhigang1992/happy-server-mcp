@@ -329,12 +329,15 @@ async function main() {
 
         // Merge environment variables: preset first, then custom overrides
         let mergedEnvVars: Record<string, string> = {};
+        let usedPresetName: string | undefined;
 
         if (environment_preset_id) {
+          // Explicit preset specified
           const envSets = await happyClient.getEnvironmentSets();
           const preset = envSets.find(s => s.id === environment_preset_id);
           if (preset) {
             mergedEnvVars = { ...preset.variables };
+            usedPresetName = preset.name;
           } else {
             return {
               content: [
@@ -345,6 +348,14 @@ async function main() {
               ],
               isError: true
             };
+          }
+        } else if (!environment_variables || Object.keys(environment_variables).length === 0) {
+          // No explicit preset and no custom variables - use default preset if available
+          const envSets = await happyClient.getEnvironmentSets();
+          const defaultPreset = envSets.find(s => s.isDefault);
+          if (defaultPreset) {
+            mergedEnvVars = { ...defaultPreset.variables };
+            usedPresetName = defaultPreset.name;
           }
         }
 
@@ -369,11 +380,12 @@ async function main() {
 
           // Build environment info for response
           let envInfo = '';
-          if (environment_preset_id || (environment_variables && Object.keys(environment_variables).length > 0)) {
+          if (Object.keys(mergedEnvVars).length > 0) {
             const envCount = Object.keys(mergedEnvVars).length;
             envInfo = `\nEnvironment: ${envCount} variable${envCount !== 1 ? 's' : ''} configured`;
-            if (environment_preset_id) {
-              envInfo += ` (preset: ${environment_preset_id})`;
+            if (usedPresetName) {
+              const isDefault = !environment_preset_id;
+              envInfo += ` (preset: "${usedPresetName}"${isDefault ? ' [default]' : ''})`;
             }
           }
 
