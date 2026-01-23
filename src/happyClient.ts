@@ -77,7 +77,7 @@ export interface EnvironmentSet {
   id: string;
   name: string;
   variables: Record<string, string>;
-  isDefault?: boolean;
+  applyByDefault?: boolean;
 }
 
 interface TodoIndex {

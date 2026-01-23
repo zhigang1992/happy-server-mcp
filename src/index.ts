@@ -189,7 +189,7 @@ async function main() {
           const varCount = Object.keys(set.variables).length;
           const varList = Object.keys(set.variables).slice(0, 5).join(', ');
           const moreCount = varCount > 5 ? ` (+${varCount - 5} more)` : '';
-          const defaultBadge = set.isDefault ? ' [DEFAULT]' : '';
+          const defaultBadge = set.applyByDefault ? ' [DEFAULT]' : '';
           return `• ${set.name}${defaultBadge}\n  ID: ${set.id}\n  Variables (${varCount}): ${varList}${moreCount}`;
         }).join('\n\n');
 
@@ -352,7 +352,7 @@ async function main() {
         } else if (!environment_variables || Object.keys(environment_variables).length === 0) {
           // No explicit preset and no custom variables - use default preset if available
           const envSets = await happyClient.getEnvironmentSets();
-          const defaultPreset = envSets.find(s => s.isDefault);
+          const defaultPreset = envSets.find(s => s.applyByDefault);
           if (defaultPreset) {
             mergedEnvVars = { ...defaultPreset.variables };
             usedPresetName = defaultPreset.name;
