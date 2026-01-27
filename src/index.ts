@@ -313,17 +313,18 @@ async function main() {
   // Start session tool
   server.tool(
     'happy_start_session',
-    'Start a new Happy AI session on a machine. Use happy_list_machines to find available machines first. Use happy_list_environment_sets to see available environment presets.',
+    'Start a new Happy AI session on a machine. Use happy_list_machines to find available machines first. Use happy_list_environment_sets to see available environment presets. Optionally create a Git worktree for isolated development.',
     {
       machine_id: z.string().describe('The machine ID to start the session on'),
-      directory: z.string().describe('The directory path to run the session in'),
+      directory: z.string().describe('The directory path to run the session in (base repository path if using worktree)'),
       message: z.string().optional().describe('Optional initial message to send to start the session working'),
       agent: z.enum(['claude', 'codex']).optional().describe('Agent type to use (default: claude)'),
       wait: z.boolean().optional().describe('If true, wait for AI to finish processing initial message before returning (default: false)'),
       environment_preset_id: z.string().optional().describe('Optional ID of an environment preset to use (from happy_list_environment_sets). Preset variables are applied first, then custom variables override them.'),
-      environment_variables: z.record(z.string(), z.string()).optional().describe('Optional custom environment variables as key-value pairs. These override any variables from the preset.')
+      environment_variables: z.record(z.string(), z.string()).optional().describe('Optional custom environment variables as key-value pairs. These override any variables from the preset.'),
+      worktree: z.string().optional().describe('Optional Git branch name for creating a worktree. If provided, creates a new branch and worktree at .dev/worktree/<name> and spawns the session there. The directory must be a Git repository.')
     },
-    async ({ machine_id, directory, message, agent, wait, environment_preset_id, environment_variables }) => {
+    async ({ machine_id, directory, message, agent, wait, environment_preset_id, environment_variables, worktree }) => {
       try {
         const happyClient = await getClient();
 
@@ -370,7 +371,8 @@ async function main() {
           message,
           agent ?? 'claude',
           wait ?? false,
-          Object.keys(mergedEnvVars).length > 0 ? mergedEnvVars : undefined
+          Object.keys(mergedEnvVars).length > 0 ? mergedEnvVars : undefined,
+          worktree
         );
 
         if (result.success && result.sessionId) {
@@ -389,11 +391,18 @@ async function main() {
             }
           }
 
+          // Build worktree info for response
+          let worktreeInfo = '';
+          const actualDirectory = result.worktreePath || directory;
+          if (result.worktreePath && result.branchName) {
+            worktreeInfo = `\nWorktree: Created branch "${result.branchName}" at ${result.worktreePath}`;
+          }
+
           return {
             content: [
               {
                 type: 'text' as const,
-                text: `Session started successfully!\n\nSession ID: ${result.sessionId}\nDirectory: ${directory}\nAgent: ${agent ?? 'claude'}${envInfo}${message ? `\n\nInitial message: "${message}"` : ''}\n\n${waitNote}${result.error ? `\n\nWarning: ${result.error}` : ''}`
+                text: `Session started successfully!\n\nSession ID: ${result.sessionId}\nDirectory: ${actualDirectory}\nAgent: ${agent ?? 'claude'}${worktreeInfo}${envInfo}${message ? `\n\nInitial message: "${message}"` : ''}\n\n${waitNote}${result.error ? `\n\nWarning: ${result.error}` : ''}`
               }
             ]
           };

@@ -996,9 +996,175 @@ export class HappyClient {
   }
 
   /**
+   * Execute a bash command on a machine via RPC
+   */
+  async machineBash(
+    machineId: string,
+    command: string,
+    cwd: string
+  ): Promise<{
+    success: boolean;
+    stdout: string;
+    stderr: string;
+    exitCode: number;
+  }> {
+    const { key, variant } = this.getEncryption();
+
+    return new Promise((resolve) => {
+      let resolved = false;
+
+      const socket = io(this.serverUrl, {
+        auth: {
+          token: this.credentials.token,
+          clientType: 'user-scoped'
+        },
+        path: '/v1/updates',
+        transports: ['websocket'],
+        reconnection: false,
+        timeout: 30000
+      });
+
+      const cleanup = (result: { success: boolean; stdout: string; stderr: string; exitCode: number }) => {
+        if (resolved) return;
+        resolved = true;
+        socket.disconnect();
+        resolve(result);
+      };
+
+      const timeout = setTimeout(() => {
+        cleanup({ success: false, stdout: '', stderr: 'Connection timeout', exitCode: -1 });
+      }, 30000);
+
+      socket.on('connect', () => {
+        const encryptedParams = encodeBase64(encrypt(key, variant, { command, cwd }));
+
+        socket.emit('rpc-call', {
+          method: `${machineId}:bash`,
+          params: encryptedParams
+        }, (response: { ok: boolean; result?: string; error?: string }) => {
+          clearTimeout(timeout);
+          if (response.ok && response.result) {
+            try {
+              const decryptedResult = decrypt(key, variant, decodeBase64(response.result)) as {
+                success: boolean;
+                stdout: string;
+                stderr: string;
+                exitCode: number;
+              };
+              cleanup(decryptedResult);
+            } catch (e) {
+              cleanup({ success: false, stdout: '', stderr: `Failed to decrypt response: ${e}`, exitCode: -1 });
+            }
+          } else {
+            cleanup({ success: false, stdout: '', stderr: response.error || 'RPC call failed', exitCode: -1 });
+          }
+        });
+      });
+
+      socket.on('connect_error', (error) => {
+        clearTimeout(timeout);
+        cleanup({ success: false, stdout: '', stderr: `Connection error: ${error.message}`, exitCode: -1 });
+      });
+
+      socket.on('error', (error: { message?: string }) => {
+        clearTimeout(timeout);
+        cleanup({ success: false, stdout: '', stderr: `Socket error: ${error.message || String(error)}`, exitCode: -1 });
+      });
+    });
+  }
+
+  /**
+   * Create a Git worktree with automatic branch creation
+   */
+  async createWorktree(
+    machineId: string,
+    basePath: string,
+    branchName: string
+  ): Promise<{
+    success: boolean;
+    worktreePath: string;
+    branchName: string;
+    error?: string;
+  }> {
+    const name = branchName.trim();
+    if (!name) {
+      return {
+        success: false,
+        worktreePath: '',
+        branchName: '',
+        error: 'Branch name is required'
+      };
+    }
+
+    // Check if it's a git repository
+    const gitCheck = await this.machineBash(
+      machineId,
+      'git rev-parse --git-dir',
+      basePath
+    );
+
+    if (!gitCheck.success) {
+      return {
+        success: false,
+        worktreePath: '',
+        branchName: '',
+        error: 'Not a Git repository'
+      };
+    }
+
+    // Create the worktree with new branch
+    const worktreePath = `.dev/worktree/${name}`;
+    let result = await this.machineBash(
+      machineId,
+      `git worktree add -b ${name} ${worktreePath}`,
+      basePath
+    );
+
+    // If worktree exists, try with a different name
+    if (!result.success && result.stderr.includes('already exists')) {
+      // Try up to 3 times with numbered suffixes
+      for (let i = 2; i <= 4; i++) {
+        const newName = `${name}-${i}`;
+        const newWorktreePath = `.dev/worktree/${newName}`;
+        result = await this.machineBash(
+          machineId,
+          `git worktree add -b ${newName} ${newWorktreePath}`,
+          basePath
+        );
+
+        if (result.success) {
+          return {
+            success: true,
+            worktreePath: `${basePath}/${newWorktreePath}`,
+            branchName: newName,
+            error: undefined
+          };
+        }
+      }
+    }
+
+    if (result.success) {
+      return {
+        success: true,
+        worktreePath: `${basePath}/${worktreePath}`,
+        branchName: name,
+        error: undefined
+      };
+    }
+
+    return {
+      success: false,
+      worktreePath: '',
+      branchName: '',
+      error: result.stderr || 'Failed to create worktree'
+    };
+  }
+
+  /**
    * Start a new session on a machine
    * @param wait - If true, wait for AI to finish processing initial message
    * @param environmentVariables - Optional environment variables to pass to the session
+   * @param worktree - Optional branch name for creating a Git worktree before spawning the session
    */
   async startSession(
     machineId: string,
@@ -1006,9 +1172,28 @@ export class HappyClient {
     message?: string,
     agent: 'claude' | 'codex' = 'claude',
     wait: boolean = false,
-    environmentVariables?: Record<string, string>
-  ): Promise<{ success: boolean; sessionId?: string; error?: string }> {
+    environmentVariables?: Record<string, string>,
+    worktree?: string
+  ): Promise<{ success: boolean; sessionId?: string; worktreePath?: string; branchName?: string; error?: string }> {
     const { key, variant } = this.getEncryption();
+
+    // Step 0: If worktree is requested, create it first
+    let actualDirectory = directory;
+    let createdWorktreePath: string | undefined;
+    let createdBranchName: string | undefined;
+
+    if (worktree) {
+      const worktreeResult = await this.createWorktree(machineId, directory, worktree);
+      if (!worktreeResult.success) {
+        return {
+          success: false,
+          error: `Failed to create worktree: ${worktreeResult.error}`
+        };
+      }
+      actualDirectory = worktreeResult.worktreePath;
+      createdWorktreePath = worktreeResult.worktreePath;
+      createdBranchName = worktreeResult.branchName;
+    }
 
     // Step 1: Spawn the session via RPC
     const spawnResult = await new Promise<{ success: boolean; sessionId?: string; error?: string }>((resolve) => {
@@ -1046,7 +1231,7 @@ export class HappyClient {
           environmentVariables?: Record<string, string>;
         } = {
           type: 'spawn-in-directory',
-          directory,
+          directory: actualDirectory,
           approvedNewDirectoryCreation: true,
           agent
         };
@@ -1116,26 +1301,26 @@ export class HappyClient {
     }
 
     if (!sessionActive) {
-      return { success: true, sessionId, error: 'Session spawned but may not be ready yet' };
+      return { success: true, sessionId, worktreePath: createdWorktreePath, branchName: createdBranchName, error: 'Session spawned but may not be ready yet' };
     }
 
     // Step 3: If message provided, send it
     if (message) {
       const sendResult = await this.sendMessage(sessionId, message);
       if (!sendResult.success) {
-        return { success: true, sessionId, error: `Session started but message failed: ${sendResult.error}` };
+        return { success: true, sessionId, worktreePath: createdWorktreePath, branchName: createdBranchName, error: `Session started but message failed: ${sendResult.error}` };
       }
 
       // Step 4: If wait=true, wait for AI to finish
       if (wait) {
         const idleResult = await this.waitForIdle(sessionId);
         if (!idleResult.success) {
-          return { success: true, sessionId, error: `Session started but wait for idle failed: ${idleResult.error}` };
+          return { success: true, sessionId, worktreePath: createdWorktreePath, branchName: createdBranchName, error: `Session started but wait for idle failed: ${idleResult.error}` };
         }
       }
     }
 
-    return { success: true, sessionId };
+    return { success: true, sessionId, worktreePath: createdWorktreePath, branchName: createdBranchName };
   }
 
   /**
